@@ -1,0 +1,176 @@
+// Pure view-model helpers for the pipeline UI. No React, no I/O, so they're
+// unit tested directly (apps/web/test/pipeline.test.ts).
+import { TARGET_HEIGHTS, type JobEventView, type JobView, type VideoStatus } from "@vpp/core/domain";
+
+// ---------------------------------------------------------------------------
+// Lanes: one row per job in the pipeline view
+// ---------------------------------------------------------------------------
+
+export type Lane =
+  | { kind: "job"; key: string; label: string; job: JobView }
+  // A transcode that doesn't exist yet because the probe hasn't fanned out.
+  | { kind: "placeholder"; key: string; label: string };
+
+export function jobLabel(job: Pick<JobView, "kind" | "targetHeight">): string {
+  return job.kind === "probe" ? "Probe" : `Transcode ${job.targetHeight}p`;
+}
+
+/**
+ * Probe first, then one lane per target height. Heights without a job yet
+ * show as placeholders so the layout doesn't jump when the fan-out happens.
+ */
+export function buildLanes(jobs: JobView[]): Lane[] {
+  const probe = jobs.find((j) => j.kind === "probe");
+  const lanes: Lane[] = [
+    probe
+      ? { kind: "job", key: probe.jobId, label: jobLabel(probe), job: probe }
+      : { kind: "placeholder", key: "probe", label: "Probe" },
+  ];
+  const heights = new Set<number>([
+    ...TARGET_HEIGHTS,
+    ...jobs.filter((j) => j.kind === "transcode").map((j) => j.targetHeight),
+  ]);
+  for (const height of [...heights].sort((a, b) => a - b)) {
+    const job = jobs.find((j) => j.kind === "transcode" && j.targetHeight === height);
+    lanes.push(
+      job
+        ? { kind: "job", key: job.jobId, label: jobLabel(job), job }
+        : { kind: "placeholder", key: `t${height}`, label: `Transcode ${height}p` },
+    );
+  }
+  return lanes;
+}
+
+// ---------------------------------------------------------------------------
+// Stepper: Uploaded → Queued → Probe → Transcode → Ready
+// ---------------------------------------------------------------------------
+
+export type StepState = "done" | "active" | "todo" | "failed";
+export interface Step {
+  label: string;
+  state: StepState;
+}
+
+export function buildSteps(status: VideoStatus, jobs: JobView[]): Step[] {
+  const probe = jobs.find((j) => j.kind === "probe");
+  const transcodes = jobs.filter((j) => j.kind === "transcode");
+  const terminal = (j: JobView) => j.state === "completed" || j.state === "failed";
+
+  const uploaded: StepState = status === "uploading" ? "active" : "done";
+  const queued: StepState = status === "uploading" ? "todo" : probe && probe.state !== "pending" ? "done" : "active";
+  const probeStep: StepState = !probe || probe.state === "pending"
+    ? "todo"
+    : probe.state === "failed" ? "failed" : probe.state === "running" ? "active" : "done";
+  const transcode: StepState = transcodes.length === 0
+    ? "todo"
+    : transcodes.every(terminal)
+      ? transcodes.some((j) => j.state === "completed") ? "done" : "failed"
+      : "active";
+  const ready: StepState = status === "ready" ? "done" : status === "failed" ? "failed" : "todo";
+
+  return [
+    { label: "Uploaded", state: uploaded },
+    { label: "Queued", state: queued },
+    { label: "Probe", state: probeStep },
+    { label: "Transcode", state: transcode },
+    { label: "Ready", state: ready },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Timeline event descriptions
+// ---------------------------------------------------------------------------
+
+export type Tone = "neutral" | "info" | "success" | "warning" | "danger";
+
+export interface EventDescription {
+  title: string;
+  tone: Tone;
+  /** One-line "why this matters", shown under notable events. */
+  note?: string;
+}
+
+export function describeEvent(e: JobEventView, labelFor: (jobId: string) => string | undefined): EventDescription {
+  const job = (e.jobId && labelFor(e.jobId)) || "Job";
+  const d = e.detail;
+  switch (e.type) {
+    case "upload_completed":
+      return { title: "Upload verified in storage", tone: "info" };
+    case "job_created": {
+      const label = d.kind === "probe" ? "Probe" : `Transcode ${String(d.targetHeight)}p`;
+      return { title: `${label} job queued via outbox`, tone: "neutral" };
+    }
+    case "claimed":
+      return e.attempt && e.attempt > 1
+        ? {
+            title: `${job} reclaimed (attempt ${e.attempt})`,
+            tone: "warning",
+            note: "The previous attempt's lease expired, so another worker took over.",
+          }
+        : { title: `${job} claimed`, tone: "info" };
+    case "completed":
+      return { title: `${job} completed`, tone: "success" };
+    case "failed":
+      return { title: `${job} failed: ${String(d.error ?? "unknown error")}`, tone: "danger" };
+    case "stale_write_rejected":
+      return {
+        title: `${job}: stale write rejected`,
+        tone: "danger",
+        note: "Fencing: this worker lost its lease, so its result was discarded.",
+      };
+    case "released":
+      return {
+        title: `${job} handed back (worker shutting down)`,
+        tone: "warning",
+        note: "Graceful shutdown released the lease so another worker could take over immediately.",
+      };
+    case "lease_expired":
+      return { title: `${job} lease expired`, tone: "warning" };
+    case "retry_scheduled":
+      return { title: `${job} retry scheduled`, tone: "warning" };
+    case "video_status":
+      return { title: `Video ${String(d.from)} → ${String(d.to)}`, tone: d.to === "failed" ? "danger" : d.to === "ready" ? "success" : "neutral" };
+    default:
+      return { title: e.type.replaceAll("_", " "), tone: "neutral" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+export function formatRelative(iso: string, now = Date.now()): string {
+  const s = Math.round((now - new Date(iso).getTime()) / 1000);
+  if (s < 10) return "just now";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+/** Worker IDs are `<hostname>-<pid>`; hostnames can be long, the pid is what you'd `kill`. */
+export function shortWorker(id: string): string {
+  const dash = id.lastIndexOf("-");
+  if (dash < 0) return id;
+  const host = id.slice(0, dash);
+  return `${host.length > 12 ? `${host.slice(0, 12)}…` : host}:${id.slice(dash + 1)}`;
+}

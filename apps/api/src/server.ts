@@ -1,6 +1,10 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import cookie from "@fastify/cookie";
 import { ZodError } from "zod";
-import { AppError, pool } from "@vpp/core";
+import { AppError, config, pool } from "@vpp/core";
+import { EventHub } from "./events.ts";
+import { eventRoutes } from "./routes/events.ts";
+import { SESSION_COOKIE, sessionRoutes } from "./routes/session.ts";
 import { videoRoutes } from "./routes/videos.ts";
 
 // Module augmentation: teach TypeScript that every request carries `userId`,
@@ -12,9 +16,25 @@ declare module "fastify" {
   }
 }
 
+// Routes reachable without an identity, keyed by "METHOD path". They still get
+// `req.userId` filled in when the caller happens to be logged in.
+const PUBLIC_ROUTES = new Set(["GET /health", "POST /session", "GET /session"]);
+
+/** Who is calling: X-User-Id header (tests, curl) or the signed demo cookie (browser). */
+function identify(req: FastifyRequest): string {
+  const header = req.headers["x-user-id"];
+  if (typeof header === "string" && header.length > 0) return header;
+  const raw = req.cookies[SESSION_COOKIE];
+  const unsigned = raw ? req.unsignCookie(raw) : null;
+  return unsigned?.valid && unsigned.value ? unsigned.value : "";
+}
+
 /** Builds the app without listening, so tests can drive it with `app.inject()`. */
 export function buildApp(opts: { logger?: boolean } = {}): FastifyInstance {
   const app = Fastify({ logger: opts.logger ?? false });
+  const hub = new EventHub();
+
+  app.register(cookie, { secret: config.SESSION_SECRET });
 
   app.get("/health", async () => {
     await pool.query("SELECT 1");
@@ -22,15 +42,14 @@ export function buildApp(opts: { logger?: boolean } = {}): FastifyInstance {
   });
 
   // Auth stub: the server derives ownership from the caller's identity, never
-  // from the request body. Swap this for real auth (JWT, session) later.
+  // from the request body. Accepts the signed demo cookie (browser) or an
+  // X-User-Id header (tests, curl). Swap this for real auth later.
   app.decorateRequest("userId", "");
   app.addHook("onRequest", async (req) => {
-    if (req.url === "/health") return;
-    const userId = req.headers["x-user-id"];
-    if (typeof userId !== "string" || userId.length === 0) {
-      throw new AppError(401, "unauthenticated", "Missing X-User-Id header");
+    req.userId = identify(req);
+    if (!req.userId && !PUBLIC_ROUTES.has(`${req.method} ${req.routeOptions.url}`)) {
+      throw new AppError(401, "unauthenticated", "Log in first (POST /session) or send X-User-Id");
     }
-    req.userId = userId;
   });
 
   app.setErrorHandler((err, req, reply) => {
@@ -44,6 +63,11 @@ export function buildApp(opts: { logger?: boolean } = {}): FastifyInstance {
     return reply.status(500).send({ error: "internal" });
   });
 
+  app.addHook("onReady", () => hub.start());
+  app.addHook("onClose", () => hub.close());
+
+  app.register(sessionRoutes);
   app.register(videoRoutes);
+  app.register(eventRoutes(hub));
   return app;
 }

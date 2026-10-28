@@ -10,13 +10,20 @@
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "setup": "tsx scripts/setup.ts",
+    "dev": "tsx scripts/dev.ts",
     "dev:api": "npm run dev -w @vpp/api",
+    "dev:web": "npm run dev -w @vpp/web",
+    "dev:dispatcher": "npm run dev -w @vpp/dispatcher",
+    "dev:worker": "npm run dev -w @vpp/worker",
+    "build:web": "npm run build -w @vpp/web",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke:ui": "tsx scripts/ui-smoke.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
+    "playwright": "^1.64.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"

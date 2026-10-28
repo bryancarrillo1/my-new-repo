@@ -12,6 +12,20 @@ const ConfigSchema = z.object({
   API_PORT: z.coerce.number().int().default(3000),
   UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
   MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(5 * 1024 ** 3),
+  // Browser origins allowed to PUT directly to storage (the UI dev server and the M9 gateway).
+  CORS_ORIGINS: z
+    .string()
+    .default("http://localhost:5173,http://localhost:8080")
+    .transform((s) => s.split(",").map((o) => o.trim()).filter(Boolean)),
+  SESSION_SECRET: z.string().min(32).default("dev-only-session-secret-change-me-in-prod"),
+
+  SQS_ENDPOINT: z.url().default("http://localhost:9324"),
+  SQS_QUEUE_NAME: z.string().default("jobs"),
+
+  // How long a claimed job is reserved for one worker before others may take it.
+  JOB_LEASE_SECONDS: z.coerce.number().int().positive().default(30),
+  // M2 placeholder worker: duration of each fake progress step (10 steps per job).
+  PLACEHOLDER_STEP_MS: z.coerce.number().int().nonnegative().default(400),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

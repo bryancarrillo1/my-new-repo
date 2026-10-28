@@ -138,3 +138,43 @@ describe("idempotent create", () => {
     expect(res.statusCode).toBe(422);
   });
 });
+
+describe("session + live events", () => {
+  it("logs in with a signed cookie that authenticates later requests", async () => {
+    const login = await app.inject({ method: "POST", url: "/session", payload: { username: "cookie-user" } });
+    expect(login.statusCode).toBe(200);
+    const cookie = login.cookies[0]!;
+    const me = await app.inject({ url: "/session", cookies: { [cookie.name]: cookie.value } });
+    expect(me.json()).toEqual({ username: "cookie-user" });
+
+    // An unsigned (forged) cookie is ignored: you're simply not logged in.
+    const forged = await app.inject({ url: "/session", cookies: { [cookie.name]: "cookie-user" } });
+    expect(forged.json()).toEqual({ username: null });
+    const blocked = await app.inject({ url: "/videos", cookies: { [cookie.name]: "cookie-user" } });
+    expect(blocked.statusCode).toBe(401);
+  });
+
+  it("streams the owner's pipeline events over SSE", async () => {
+    const address = await app.listen({ port: 0, host: "127.0.0.1" });
+    const abort = new AbortController();
+    const res = await fetch(`${address}/events`, { headers, signal: abort.signal });
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+
+    const bytes = new TextEncoder().encode("abc");
+    const { body } = await createVideo(bytes.length);
+    await putBytes(body.uploadUrl, bytes);
+    await complete(body.videoId, body.uploadId);
+
+    // Read chunks until we see the upload_completed event for our video.
+    const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let text = "";
+    while (!text.includes(`"type":"upload_completed"`)) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += value;
+    }
+    abort.abort();
+    expect(text).toContain(`"videoId":"${body.videoId}"`);
+    expect(text).toContain(`"type":"job_created"`);
+  });
+});

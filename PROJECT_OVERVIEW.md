@@ -140,10 +140,10 @@ flowchart LR
 
 ## Implementation decisions
 
-These choices close the open items above. The implementation follows them; see [README.md](README.md) for progress.
+These choices close the open items above. The implementation follows them; see [docs/ROADMAP.md](docs/ROADMAP.md) for milestones and progress.
 
 - **Postgres owns job state; the queue only wakes workers up.** Messages carry a `jobId`. Workers claim the row before doing work, and a reconciler re-enqueues jobs that are stuck or whose lease has expired.
-- **Claiming and fencing:** a worker claims a job with a conditional `UPDATE` that increments `attempt` and sets `lease_expires_at`. The completion write includes `WHERE attempt = <mine>`, so a stale worker's write matches 0 rows. A heartbeat extends both the DB lease and the queue visibility timeout.
+- **Claiming and fencing:** a worker claims a job with a conditional `UPDATE` that increments `attempt` and sets `lease_expires_at`. The completion write includes `WHERE attempt = <mine>`, so a stale worker's write matches 0 rows. A heartbeat renews the DB lease and the queue visibility timeout every lease/3, and abandons the work if renewal finds the lease gone. Without it, any job longer than one lease livelocks: it is reclaimed mid-run, and every attempt's result is rejected by fencing. The first chaos run hit exactly this.
 - **`/complete` creates one `probe` job**, not one job per resolution. The probe checks the real duration, resolution, and decodability, then creates the eligible transcode jobs and their outbox rows in one transaction.
 - **One retry counter:** `processing_jobs.attempt` and `max_attempts` are authoritative. Queue redrive to the DLQ is only a backstop for poison messages.
 - **Aggregate status** is recomputed in the completion transaction, under `SELECT … FOR UPDATE` on the video row. It is `processing` while any job is non-terminal; `ready` when all jobs are terminal and at least one rendition is ready; `failed` when all are terminal and none is ready.
@@ -152,3 +152,11 @@ These choices close the open items above. The implementation follows them; see [
 - **Dispatcher:** claims outbox rows with `FOR UPDATE SKIP LOCKED`. Delivery is at-least-once by design; consumers must be idempotent.
 - **Segment alignment:** every rendition uses a fixed GOP (`-g`, `-keyint_min`, `-sc_threshold 0`) so HLS segment boundaries line up.
 - **Local stack:** Node/TypeScript (Fastify, zod, `pg` with plain SQL), Postgres, SeaweedFS for S3, ElasticMQ for SQS, and nginx as the CDN stand-in.
+- **A queue message for a job that can't be claimed is acknowledged and dropped.** This covers jobs already finished or held under a live lease. Liveness for jobs whose worker died comes from the visibility timeout, which equals the lease, and from the reconciler, never from leaving messages in the queue.
+- **Live updates:** every state change writes a `job_events` row and runs `pg_notify` in the same transaction, so listeners hear only about committed changes. The API holds one `LISTEN` connection and streams events to browsers over Server-Sent Events. Events are refetch hints, not state.
+- **Demo identity:** a signed cookie set by `POST /session` stands in for auth, because browsers' `EventSource` can't send headers. `X-User-Id` remains for tests and curl. Ownership is always derived server-side.
+- **Two buckets:** originals stay private and are reachable only via presigned URLs. Renditions, thumbnails, and manifests are public-read behind the CDN.
+- **Presigning host:** signatures cover the host, so URLs are signed against `S3_PUBLIC_ENDPOINT`, the address the browser uses. This can differ from the address the services use inside Docker.
+- **Lock for status recompute is `FOR NO KEY UPDATE`, not `FOR UPDATE`.** A completing transaction has already inserted a `job_events` row, and that row's foreign key holds `FOR KEY SHARE` on the video. `FOR UPDATE` conflicts with it, so two concurrent completions deadlocked. `FOR NO KEY UPDATE` is compatible with the foreign-key lock and still serializes recomputes.
+- **Graceful shutdown hands work back instead of abandoning it.** Workers never abort an in-flight `ReceiveMessage`: an aborted long-poll can still be handed a message, which then hides for a visibility timeout. A worker stopped mid-job releases its lease with a fenced update and sets the message's visibility to 0, so another worker resumes immediately. A hard crash still recovers, one lease later.
+- **Browser uploads need bucket CORS.** The UI's origin PUTs directly to storage, so the bucket carries a CORS rule for the UI origins. API requests go through the same-origin `/api` proxy, so the API needs no CORS.

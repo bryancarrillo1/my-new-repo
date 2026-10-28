@@ -1,0 +1,214 @@
+import { useMemo } from "react";
+import { Link, useParams } from "react-router";
+import type { JobEventView, JobView, VideoDetail } from "@vpp/core/domain";
+import { api, ApiError } from "../lib/api.ts";
+import {
+  buildLanes,
+  buildSteps,
+  describeEvent,
+  formatDuration,
+  formatRelative,
+  jobLabel,
+  shortWorker,
+  type Lane,
+  type Step,
+} from "../lib/pipeline.ts";
+import { useLiveQuery, useNow } from "../hooks/useLiveQuery.ts";
+import { JobStateBadge, ProgressBar, ResolutionChips, Spinner, StatusBadge, cx } from "../components/ui.tsx";
+import styles from "./VideoPage.module.css";
+
+export function VideoPage() {
+  const { videoId = "" } = useParams();
+  const { data: video, error, loading } = useLiveQuery(
+    videoId,
+    () => api.getVideo(videoId),
+    (e) => e.videoId === videoId,
+  );
+
+  if (loading) return <Spinner />;
+  if (error) {
+    return (
+      <div className={styles.notFound}>
+        <h1>{error instanceof ApiError && error.status === 404 ? "Video not found" : "Couldn't load video"}</h1>
+        <p className="muted">{error.message}</p>
+        <Link to="/" className="btn">
+          ← Back to library
+        </Link>
+      </div>
+    );
+  }
+  if (!video) return null;
+  return <VideoView video={video} />;
+}
+
+function VideoView({ video }: { video: VideoDetail }) {
+  const anyRunning = video.jobs.some((j) => j.state === "running");
+  const now = useNow(anyRunning); // ticks only while something is running
+  const lanes = useMemo(() => buildLanes(video.jobs), [video.jobs]);
+  const steps = useMemo(() => buildSteps(video.status, video.jobs), [video.status, video.jobs]);
+  const labelFor = useMemo(() => {
+    const byId = new Map(video.jobs.map((j) => [j.jobId, jobLabel(j)]));
+    return (jobId: string) => byId.get(jobId);
+  }, [video.jobs]);
+
+  return (
+    <article className={styles.page}>
+      <Link to="/" className={styles.back}>
+        ← Library
+      </Link>
+
+      <header className={styles.header}>
+        <div className={styles.titleRow}>
+          <h1>{video.title}</h1>
+          <StatusBadge status={video.status} />
+        </div>
+        <div className={styles.subRow}>
+          <ResolutionChips available={video.availableResolutions} />
+          <span className="muted">Uploaded {formatRelative(video.createdAt)}</span>
+          <code className={styles.id}>{video.videoId}</code>
+        </div>
+      </header>
+
+      <Stepper steps={steps} />
+
+      <div className={styles.columns}>
+        <div className={styles.mainCol}>
+          <PlayerPlaceholder video={video} />
+
+          <section className={`card ${styles.panel}`}>
+            <div className={styles.panelHead}>
+              <h2>Pipeline</h2>
+              <span className="muted">
+                {video.jobs.length} job{video.jobs.length === 1 ? "" : "s"} · updates live
+              </span>
+            </div>
+            <div className={styles.lanes}>
+              {lanes.map((lane) => (
+                <LaneRow key={lane.key} lane={lane} now={now} />
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <aside className={`card ${styles.panel} ${styles.timelinePanel}`}>
+          <div className={styles.panelHead}>
+            <h2>Event timeline</h2>
+            <span className="muted">{video.events.length} events</span>
+          </div>
+          <Timeline events={video.events} labelFor={labelFor} />
+        </aside>
+      </div>
+    </article>
+  );
+}
+
+function Stepper({ steps }: { steps: Step[] }) {
+  return (
+    <ol className={styles.stepper}>
+      {steps.map((s) => (
+        <li key={s.label} className={cx(styles.stepItem, styles[`step_${s.state}`])}>
+          <span className={styles.stepDot}>{s.state === "done" ? "✓" : s.state === "failed" ? "✕" : ""}</span>
+          <span>{s.label}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function PlayerPlaceholder({ video }: { video: VideoDetail }) {
+  const best = video.availableResolutions.at(-1);
+  return (
+    <div className={styles.player}>
+      {video.playbackReady ? (
+        <>
+          <div className={styles.playerIcon}>▶</div>
+          <div className={styles.playerTitle}>Playable at {best}p</div>
+          <div className={styles.playerNote}>
+            {video.status === "ready"
+              ? "All renditions are done."
+              : "Higher resolutions are still processing; playback doesn't wait for them."}{" "}
+            The HLS player arrives in M6.
+          </div>
+        </>
+      ) : video.status === "failed" ? (
+        <div className={styles.playerTitle}>Processing failed: nothing playable</div>
+      ) : (
+        <>
+          <Spinner />
+          <div className={styles.playerTitle}>Waiting for the first rendition</div>
+          <div className={styles.playerNote}>Playback starts as soon as any resolution is verified.</div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function LaneRow({ lane, now }: { lane: Lane; now: number }) {
+  if (lane.kind === "placeholder") {
+    return (
+      <div className={cx(styles.lane, styles.lanePlaceholder)}>
+        <div className={styles.laneLabel}>{lane.label}</div>
+        <div className={styles.laneWaiting}>waiting for probe to fan out</div>
+      </div>
+    );
+  }
+  const job: JobView = lane.job;
+  const started = job.startedAt ? new Date(job.startedAt).getTime() : null;
+  const ended = job.finishedAt ? new Date(job.finishedAt).getTime() : job.state === "running" ? now : null;
+  const elapsed = started && ended ? ended - started : null;
+
+  return (
+    <div className={cx(styles.lane, job.state === "running" && styles.laneRunning)}>
+      <div className={styles.laneLabel}>{lane.label}</div>
+      <div className={styles.laneState}>
+        <JobStateBadge state={job.state} />
+      </div>
+      <div className={styles.laneProgress}>
+        <ProgressBar value={job.progress} state={job.state} />
+        <span className={styles.pct}>{Math.round((job.state === "completed" ? 1 : job.progress) * 100)}%</span>
+      </div>
+      <div className={styles.laneMeta}>
+        <span className={cx(job.attempt > 1 && styles.retried)} title="Attempt number (also the fencing token)">
+          attempt {job.attempt}/{job.maxAttempts}
+        </span>
+        {job.leaseOwner && (
+          <span className={styles.worker} title={`Lease held by ${job.leaseOwner}`}>
+            {shortWorker(job.leaseOwner)}
+          </span>
+        )}
+        {elapsed !== null && <span>{formatDuration(elapsed)}</span>}
+      </div>
+      {job.lastError && <div className={styles.laneError}>{job.lastError}</div>}
+    </div>
+  );
+}
+
+function Timeline({
+  events,
+  labelFor,
+}: {
+  events: JobEventView[];
+  labelFor: (jobId: string) => string | undefined;
+}) {
+  if (events.length === 0) return <p className="muted">No events yet.</p>;
+  return (
+    <ol className={styles.timeline}>
+      {events.map((e) => {
+        const d = describeEvent(e, labelFor);
+        return (
+          <li key={e.id} className={cx(styles.event, styles[`tone_${d.tone}`])}>
+            <span className={styles.eventDot} />
+            <div className={styles.eventBody}>
+              <div className={styles.eventTitle}>{d.title}</div>
+              {d.note && <div className={styles.eventNote}>{d.note}</div>}
+              <div className={styles.eventMeta}>
+                <time dateTime={e.at}>{new Date(e.at).toLocaleTimeString([], { hour12: false })}</time>
+                {e.workerId && <span>{shortWorker(e.workerId)}</span>}
+              </div>
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}

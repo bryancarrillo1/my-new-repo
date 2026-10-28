@@ -7,6 +7,7 @@
     "start": "tsx src/main.ts"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.5",
     "@vpp/core": "*",
     "fastify": "^5.12.5",
     "zod": "^4.6.5"

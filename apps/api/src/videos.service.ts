@@ -3,26 +3,29 @@ import {
   AppError,
   NotFoundError,
   config,
+  emitEvent,
+  enqueueJob,
   headObjectSize,
   originalKey,
   pool,
   presignUpload,
+  recomputeVideoStatus,
   withTransaction,
+  type CreateVideoResponse,
+  type JobEventView,
+  type JobView,
+  type JobKind,
+  type JobState,
   type UploadSessionStatus,
+  type VideoDetail,
   type VideoStatus,
+  type VideoSummary,
 } from "@vpp/core";
 
 export interface CreateVideoInput {
   title: string;
   fileName: string;
   fileSizeBytes: number;
-}
-
-export interface CreateVideoResponse {
-  videoId: string;
-  uploadId: string;
-  uploadUrl: string;
-  uploadUrlExpiresAt: string;
 }
 
 export interface VideoStatusResponse {
@@ -180,31 +183,126 @@ export async function completeUpload(
         WHERE id = $1 AND status = 'pending'`,
       [uploadId],
     );
-    await tx.query(
+    const moved = await tx.query(
       `UPDATE videos SET status = 'queued', updated_at = now()
         WHERE id = $1 AND status = 'uploading'`,
       [videoId],
     );
-    // M2: insert the probe job + outbox row here, in this same transaction.
-    const { rows } = await tx.query<{ status: VideoStatus }>(`SELECT status FROM videos WHERE id = $1`, [videoId]);
-    return rows[0]!.status;
+    if (moved.rowCount) await emitEvent(tx, { videoId, type: "upload_completed" });
+    // Transactional outbox: the probe job and the instruction to enqueue it
+    // commit together with the status change, or not at all. The API never
+    // talks to the queue directly; the dispatcher does.
+    await enqueueJob(tx, { videoId, kind: "probe" });
+    return recomputeVideoStatus(tx, videoId);
   });
 
   return { videoId, status };
 }
 
 // ---------------------------------------------------------------------------
-// GET /videos/:videoId/status
+// Reads: status, library, detail
 // ---------------------------------------------------------------------------
 
-export async function getVideoStatus(ownerId: string, videoId: string): Promise<VideoStatusResponse> {
-  const { rows } = await pool.query<{ status: VideoStatus }>(
-    `SELECT status FROM videos WHERE id = $1 AND owner_id = $2`,
-    [videoId, ownerId],
-  );
-  const video = rows[0];
-  if (!video) throw new NotFoundError("Video");
+interface VideoRow {
+  id: string;
+  title: string;
+  status: VideoStatus;
+  created_at: Date;
+  // Aggregated from `renditions`: only verified outputs are ever listed.
+  heights: number[];
+  progress: number | null;
+}
 
-  // Renditions don't exist until M4, so nothing is playable yet.
-  return { videoId, status: video.status, playbackReady: false, availableResolutions: [] };
+// One query for both list and detail views; `$2` optionally narrows to one video.
+const VIDEO_SELECT = `
+  SELECT v.id, v.title, v.status, v.created_at,
+         coalesce(array_agg(r.height ORDER BY r.height) FILTER (WHERE r.height IS NOT NULL), '{}') AS heights,
+         (SELECT avg(j.progress)::float8 FROM processing_jobs j
+           WHERE j.video_id = v.id AND j.kind = 'transcode') AS progress
+    FROM videos v
+    LEFT JOIN renditions r ON r.video_id = v.id
+   WHERE v.owner_id = $1 AND ($2::uuid IS NULL OR v.id = $2)
+   GROUP BY v.id
+   ORDER BY v.created_at DESC
+   LIMIT 100`;
+
+function toSummary(row: VideoRow): VideoSummary {
+  return {
+    videoId: row.id,
+    title: row.title,
+    status: row.status,
+    // Playback readiness is independent of overall status: one finished
+    // rendition is enough to start watching while the others keep processing.
+    playbackReady: row.heights.length > 0,
+    availableResolutions: row.heights,
+    progress: row.progress,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+async function findVideo(ownerId: string, videoId: string): Promise<VideoSummary> {
+  const { rows } = await pool.query<VideoRow>(VIDEO_SELECT, [ownerId, videoId]);
+  if (!rows[0]) throw new NotFoundError("Video");
+  return toSummary(rows[0]);
+}
+
+export async function listVideos(ownerId: string): Promise<VideoSummary[]> {
+  const { rows } = await pool.query<VideoRow>(VIDEO_SELECT, [ownerId, null]);
+  return rows.map(toSummary);
+}
+
+export async function getVideoStatus(ownerId: string, videoId: string): Promise<VideoStatusResponse> {
+  const { videoId: id, status, playbackReady, availableResolutions } = await findVideo(ownerId, videoId);
+  return { videoId: id, status, playbackReady, availableResolutions };
+}
+
+export async function getVideoDetail(ownerId: string, videoId: string): Promise<VideoDetail> {
+  const summary = await findVideo(ownerId, videoId);
+
+  const { rows: jobs } = await pool.query<{
+    id: string; kind: JobKind; target_height: number; state: JobState; attempt: number;
+    max_attempts: number; progress: number; lease_owner: string | null; last_error: string | null;
+    started_at: Date | null; finished_at: Date | null;
+  }>(
+    `SELECT id, kind, target_height, state, attempt, max_attempts, progress, lease_owner,
+            last_error, started_at, finished_at
+       FROM processing_jobs WHERE video_id = $1
+      ORDER BY (kind = 'probe') DESC, target_height`,
+    [videoId],
+  );
+
+  const { rows: events } = await pool.query<{
+    id: string; job_id: string | null; type: string; attempt: number | null;
+    worker_id: string | null; detail: Record<string, unknown>; at: Date;
+  }>(
+    `SELECT id, job_id, type, attempt, worker_id, detail, at
+       FROM job_events WHERE video_id = $1 ORDER BY id DESC LIMIT 200`,
+    [videoId],
+  );
+
+  return {
+    ...summary,
+    jobs: jobs.map((j): JobView => ({
+      jobId: j.id,
+      kind: j.kind,
+      targetHeight: j.target_height,
+      state: j.state,
+      attempt: j.attempt,
+      maxAttempts: j.max_attempts,
+      progress: j.progress,
+      leaseOwner: j.lease_owner,
+      lastError: j.last_error,
+      startedAt: j.started_at?.toISOString() ?? null,
+      finishedAt: j.finished_at?.toISOString() ?? null,
+    })),
+    events: events.map((e): JobEventView => ({
+      id: Number(e.id), // bigserial arrives as a string, like bigint above
+      jobId: e.job_id,
+      type: e.type,
+      attempt: e.attempt,
+      workerId: e.worker_id,
+      detail: e.detail,
+      at: e.at.toISOString(),
+    })),
+  };
 }

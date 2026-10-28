@@ -2,6 +2,7 @@ import {
   CreateBucketCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  PutBucketCorsCommand,
   PutObjectCommand,
   S3Client,
   S3ServiceException,
@@ -47,10 +48,29 @@ export async function headObjectSize(key: string): Promise<number | null> {
   }
 }
 
+/** Creates the bucket if missing and (re)applies its CORS rule. Safe to run repeatedly. */
 export async function ensureBucket(): Promise<void> {
   try {
     await s3.send(new HeadBucketCommand({ Bucket: config.S3_BUCKET }));
   } catch {
     await s3.send(new CreateBucketCommand({ Bucket: config.S3_BUCKET }));
   }
+  // The browser uploads straight to storage from another origin (the UI), so
+  // storage itself must allow that origin. The API is never in the byte path.
+  await s3.send(
+    new PutBucketCorsCommand({
+      Bucket: config.S3_BUCKET,
+      CORSConfiguration: {
+        CORSRules: [
+          {
+            AllowedOrigins: config.CORS_ORIGINS,
+            AllowedMethods: ["PUT", "GET", "HEAD"],
+            AllowedHeaders: ["*"],
+            ExposeHeaders: ["ETag"],
+            MaxAgeSeconds: 3600,
+          },
+        ],
+      },
+    }),
+  );
 }
