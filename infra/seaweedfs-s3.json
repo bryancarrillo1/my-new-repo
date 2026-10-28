@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "vpp",
+      "credentials": [{ "accessKey": "vpp", "secretKey": "vpp-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
