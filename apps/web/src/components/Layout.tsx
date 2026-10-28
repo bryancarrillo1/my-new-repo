@@ -28,6 +28,9 @@ export function Layout({ username }: { username: string }) {
             <NavLink to="/upload" className={navClass}>
               Upload
             </NavLink>
+            <NavLink to="/system" className={navClass}>
+              System
+            </NavLink>
           </nav>
           <div className={styles.spacer} />
           <div

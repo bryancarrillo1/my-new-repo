@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router";
 import type { JobEventView, JobView, VideoDetail } from "@vpp/core/domain";
 import { api, ApiError } from "../lib/api.ts";
@@ -42,8 +42,12 @@ export function VideoPage() {
 }
 
 function VideoView({ video }: { video: VideoDetail }) {
-  const anyRunning = video.jobs.some((j) => j.state === "running");
-  const now = useNow(anyRunning); // ticks only while something is running
+  // Tick only while something is moving: a running job's clock or a retry countdown.
+  const clockNow = Date.now();
+  const ticking = video.jobs.some(
+    (j) => j.state === "running" || (j.state === "pending" && new Date(j.nextAttemptAt).getTime() > clockNow),
+  );
+  const now = useNow(ticking);
   const lanes = useMemo(() => buildLanes(video.jobs), [video.jobs]);
   const steps = useMemo(() => buildSteps(video.status, video.jobs), [video.status, video.jobs]);
   const labelFor = useMemo(() => {
@@ -143,6 +147,28 @@ function PlayerPlaceholder({ video }: { video: VideoDetail }) {
   );
 }
 
+function RetryButton({ jobId }: { jobId: string }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <span className={styles.retry}>
+      <button
+        className="btn"
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          setError(null);
+          // No refetch needed: the "redriven" event arrives over SSE.
+          api.retryJob(jobId).catch((e: Error) => setError(e.message)).finally(() => setBusy(false));
+        }}
+      >
+        {busy ? "Retrying…" : "Retry job"}
+      </button>
+      {error && <span className={styles.laneErrorInline}>{error}</span>}
+    </span>
+  );
+}
+
 function LaneRow({ lane, now }: { lane: Lane; now: number }) {
   if (lane.kind === "placeholder") {
     return (
@@ -156,9 +182,17 @@ function LaneRow({ lane, now }: { lane: Lane; now: number }) {
   const started = job.startedAt ? new Date(job.startedAt).getTime() : null;
   const ended = job.finishedAt ? new Date(job.finishedAt).getTime() : job.state === "running" ? now : null;
   const elapsed = started && ended ? ended - started : null;
+  const retryIn = job.state === "pending" && job.attempt > 0 ? new Date(job.nextAttemptAt).getTime() - now : null;
 
   return (
-    <div className={cx(styles.lane, job.state === "running" && styles.laneRunning)}>
+    <div
+      className={cx(
+        styles.lane,
+        job.state === "running" && styles.laneRunning,
+        retryIn !== null && styles.laneRetrying,
+        job.state === "failed" && styles.laneFailed,
+      )}
+    >
       <div className={styles.laneLabel}>{lane.label}</div>
       <div className={styles.laneState}>
         <JobStateBadge state={job.state} />
@@ -176,9 +210,20 @@ function LaneRow({ lane, now }: { lane: Lane; now: number }) {
             {shortWorker(job.leaseOwner)}
           </span>
         )}
-        {elapsed !== null && <span>{formatDuration(elapsed)}</span>}
+        {elapsed !== null && job.state !== "pending" && <span>{formatDuration(elapsed)}</span>}
+        {retryIn !== null && (
+          <span className={styles.retried}>
+            {retryIn > 0 ? `retrying in ${formatDuration(retryIn)}` : "retry due, waiting for a worker"}
+          </span>
+        )}
+        {job.errorKind === "permanent" && <span className={styles.permanent}>permanent error</span>}
       </div>
-      {job.lastError && <div className={styles.laneError}>{job.lastError}</div>}
+      {job.lastError && job.state !== "completed" && (
+        <div className={styles.laneError}>
+          <span>{job.lastError}</span>
+          {job.state === "failed" && <RetryButton jobId={job.jobId} />}
+        </div>
+      )}
     </div>
   );
 }

@@ -12,6 +12,7 @@ export type UploadSessionStatus = (typeof UPLOAD_SESSION_STATUSES)[number];
 
 export type JobKind = "probe" | "transcode";
 export type JobState = "pending" | "running" | "completed" | "failed";
+export type ErrorKind = "retryable" | "permanent";
 
 /** Output heights we produce, smallest first. */
 export const TARGET_HEIGHTS = [360, 720, 1080] as const;
@@ -49,6 +50,9 @@ export interface JobView {
   progress: number;
   leaseOwner: string | null;
   lastError: string | null;
+  errorKind: ErrorKind | null;
+  /** When a pending job may next be claimed (in the future while backing off). */
+  nextAttemptAt: string;
   startedAt: string | null;
   finishedAt: string | null;
 }
@@ -66,6 +70,39 @@ export interface JobEventView {
 export interface VideoDetail extends VideoSummary {
   jobs: JobView[];
   events: JobEventView[];
+}
+
+/** Fault-injection settings (one global row), editable from the System page. */
+export interface ChaosSettings {
+  failureRate: number;
+  permanentFailures: boolean;
+  slowFactor: number;
+  dispatcherPaused: boolean;
+  crashNext: number;
+}
+
+export interface WorkerView {
+  workerId: string;
+  hostname: string;
+  pid: number;
+  startedAt: string;
+  lastSeenAt: string;
+  /** False once the heartbeat has stopped (crashed); the reconciler then removes it. */
+  alive: boolean;
+  currentJob: { jobId: string; label: string; videoId: string; videoTitle: string } | null;
+  killRequested: boolean;
+}
+
+export interface SystemView {
+  workers: WorkerView[];
+  chaos: ChaosSettings;
+  queues: {
+    jobs: { visible: number; inFlight: number };
+    deadLetter: { visible: number; inFlight: number };
+  };
+  /** Outbox rows not yet sent: grows while the dispatcher is paused or down. */
+  outboxBacklog: number;
+  jobsByState: Record<JobState, number>;
 }
 
 /** Payload pushed over Server-Sent Events. A hint to refetch, not the state itself. */

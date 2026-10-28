@@ -3,7 +3,12 @@
 export const TEST_ENV = {
   DATABASE_URL: "postgres://vpp:vpp@localhost:5433/vpp_test",
   SQS_QUEUE_NAME: "jobs-test",
+  SQS_DLQ_NAME: "jobs-test-dlq",
   S3_BUCKET: "videos-test",
   JOB_LEASE_SECONDS: "5",
   PLACEHOLDER_STEP_MS: "10",
+  RETRY_BASE_MS: "50",
+  RETRY_MAX_MS: "200",
+  RECONCILE_STALE_PENDING_SECONDS: "1",
+  WORKER_HEARTBEAT_MS: "100",
 };

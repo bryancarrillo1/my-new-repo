@@ -5,20 +5,25 @@ import { z } from "zod";
 import {
   StaleLeaseError,
   claimJob,
+  classifyError,
   config,
   deleteJobMessage,
   extendLease,
   extendMessageVisibility,
+  getChaos,
   getJob,
-  markJobFailed,
   pool,
   receiveJobMessages,
-  recomputeVideoStatus,
   recordEvent,
+  recordFailure,
+  registerWorker,
   releaseJob,
+  unregisterWorker,
   withTransaction,
+  workerHeartbeat,
   type JobRow,
 } from "@vpp/core";
+import { SimulatedCrash, faultsFrom, runtime } from "./faults.ts";
 import { handlers } from "./handlers.ts";
 
 const JobMessageSchema = z.object({ jobId: z.uuid() });
@@ -29,11 +34,22 @@ export function makeWorkerId(): string {
 
 type Log = Pick<Console, "info" | "warn" | "error">;
 
+/** What this worker is doing right now; reported by the registry heartbeat. */
+export interface WorkerState {
+  currentJobId: string | null;
+}
+
 /**
  * Handles one queue message end to end. The message is only a pointer: the
  * job row in Postgres decides whether there is anything to do.
  */
-export async function processMessage(msg: Message, workerId: string, signal: AbortSignal, log: Log = console) {
+export async function processMessage(
+  msg: Message,
+  workerId: string,
+  signal: AbortSignal,
+  log: Log = console,
+  state: WorkerState = { currentJobId: null },
+) {
   const parsed = JobMessageSchema.safeParse(JSON.parse(msg.Body ?? "null"));
   if (!parsed.success) {
     log.warn(`[${workerId}] dropping malformed message`, msg.Body);
@@ -58,10 +74,13 @@ export async function processMessage(msg: Message, workerId: string, signal: Abo
   // our lease is gone. AbortSignal.any combines the two.
   const leaseLost = new AbortController();
   const stopHeartbeat = startHeartbeat(job, msg.ReceiptHandle!, leaseLost, workerId, log);
+  state.currentJobId = job.id;
   try {
-    await handlers[job.kind]({ job, workerId, signal: AbortSignal.any([signal, leaseLost.signal]) });
+    const faults = faultsFrom(await getChaos(pool));
+    await handlers[job.kind]({ job, workerId, signal: AbortSignal.any([signal, leaseLost.signal]), faults });
     log.info(`[${workerId}] completed job ${jobId}`);
   } catch (err) {
+    if (err instanceof SimulatedCrash) throw err; // tests only: behave like process death
     if (signal.aborted) {
       // Shutting down mid-job is not a job failure. Hand the job back so
       // another worker can take it right away: release the DB lease (fenced)
@@ -77,6 +96,7 @@ export async function processMessage(msg: Message, workerId: string, signal: Abo
     await handleFailure(job, workerId, cause, log);
   } finally {
     stopHeartbeat();
+    state.currentJobId = null;
   }
   await deleteJobMessage(msg.ReceiptHandle!);
 }
@@ -139,14 +159,14 @@ async function handleFailure(job: JobRow, workerId: string, err: unknown, log: L
   }
 
   const message = err instanceof Error ? err.message : String(err);
-  log.error(`[${workerId}] job ${job.id} failed: ${message}`);
-  // M2: every failure is final. M4 adds retries with backoff for transient errors.
+  const kind = classifyError(err);
   try {
-    await withTransaction(async (tx) => {
-      await markJobFailed(tx, job, workerId, message);
-      await recomputeVideoStatus(tx, job.video_id);
-    });
+    const outcome = await withTransaction((tx) => recordFailure(tx, job, { error: message, kind, actor: workerId }));
+    log.error(
+      `[${workerId}] job ${job.id} attempt ${job.attempt}/${job.max_attempts} failed (${kind}): ${message} → ${outcome}`,
+    );
   } catch (failErr) {
+    // Lost the lease while failing: the new owner decides what happens.
     if (!(failErr instanceof StaleLeaseError)) throw failErr;
   }
 }
@@ -155,7 +175,7 @@ async function handleFailure(job: JobRow, workerId: string, err: unknown, log: L
 export async function pollOnce(
   workerId: string,
   signal: AbortSignal,
-  opts: { waitSeconds?: number; log?: Log } = {},
+  opts: { waitSeconds?: number; log?: Log; state?: WorkerState } = {},
 ): Promise<boolean> {
   // The receive is deliberately NOT cancelled by `signal`. Aborting a long-poll
   // only closes our end; the queue may still hand the next message to that
@@ -174,19 +194,45 @@ export async function pollOnce(
       await extendMessageVisibility(msg.ReceiptHandle!, 0);
       continue;
     }
-    await processMessage(msg, workerId, signal, opts.log);
+    await processMessage(msg, workerId, signal, opts.log, opts.state);
   }
   return messages.length > 0;
 }
 
+/**
+ * The worker's main loop: register in the worker registry, keep a registry
+ * heartbeat running (which is also how a "kill" from the System page arrives),
+ * and process messages until shut down.
+ */
 export async function runWorker(workerId: string, signal: AbortSignal, log: Log = console): Promise<void> {
-  while (!signal.aborted) {
-    try {
-      await pollOnce(workerId, signal, { log });
-    } catch (err) {
-      if (signal.aborted) break;
-      log.error(`[${workerId}] poll failed; backing off`, err);
-      await sleep(1000);
+  const state: WorkerState = { currentJobId: null };
+  await registerWorker(pool, { workerId, hostname: os.hostname().split(".")[0]!, pid: process.pid });
+  const stopRegistry = startRegistryHeartbeat(workerId, state, log);
+  try {
+    while (!signal.aborted) {
+      try {
+        await pollOnce(workerId, signal, { log, state });
+      } catch (err) {
+        if (signal.aborted) break;
+        log.error(`[${workerId}] poll failed; backing off`, err);
+        await sleep(1000);
+      }
     }
+  } finally {
+    stopRegistry();
+    await unregisterWorker(pool, workerId).catch(() => {});
   }
+}
+
+function startRegistryHeartbeat(workerId: string, state: WorkerState, log: Log): () => void {
+  const timer = setInterval(() => {
+    workerHeartbeat(pool, workerId, state.currentJobId).then(
+      ({ killRequested }) => {
+        // A hard exit mid-job, just like `kill -9`: no lease release, no ack.
+        if (killRequested) runtime.crash(`killed from the System page while running job ${state.currentJobId ?? "(idle)"}`);
+      },
+      (err: unknown) => log.warn(`[${workerId}] registry heartbeat failed`, err),
+    );
+  }, config.WORKER_HEARTBEAT_MS);
+  return () => clearInterval(timer);
 }

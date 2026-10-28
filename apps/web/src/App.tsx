@@ -5,6 +5,7 @@ import { EventsProvider } from "./hooks/events.tsx";
 import { SessionProvider, useSession } from "./hooks/session.tsx";
 import { LibraryPage } from "./pages/LibraryPage.tsx";
 import { LoginPage } from "./pages/LoginPage.tsx";
+import { SystemPage } from "./pages/SystemPage.tsx";
 import { UploadPage } from "./pages/UploadPage.tsx";
 import { VideoPage } from "./pages/VideoPage.tsx";
 
@@ -39,6 +40,7 @@ function Gate() {
           <Route index element={<LibraryPage />} />
           <Route path="upload" element={<UploadPage />} />
           <Route path="videos/:videoId" element={<VideoPage />} />
+          <Route path="system" element={<SystemPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

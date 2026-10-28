@@ -18,7 +18,8 @@
     "build:web": "npm run build -w @vpp/web",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "smoke:ui": "tsx scripts/ui-smoke.ts"
+    "smoke:ui": "tsx scripts/ui-smoke.ts",
+    "demo:chaos": "tsx scripts/chaos-demo.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

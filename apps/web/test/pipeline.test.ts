@@ -20,6 +20,8 @@ function job(overrides: Partial<JobView>): JobView {
     progress: 0,
     leaseOwner: null,
     lastError: null,
+    errorKind: null,
+    nextAttemptAt: new Date().toISOString(),
     startedAt: null,
     finishedAt: null,
     ...overrides,
@@ -84,10 +86,36 @@ describe("buildSteps", () => {
 describe("describeEvent", () => {
   const labelFor = () => "Transcode 720p";
 
-  it("flags reclaimed jobs as warnings with an explanation", () => {
-    const d = describeEvent(event({ type: "claimed", jobId: "j", attempt: 2 }), labelFor);
+  it("flags takeovers of a dead worker's lease as warnings with an explanation", () => {
+    const d = describeEvent(event({ type: "claimed", jobId: "j", attempt: 2, detail: { takeover: true } }), labelFor);
     expect(d).toMatchObject({ title: "Transcode 720p reclaimed (attempt 2)", tone: "warning" });
     expect(d.note).toMatch(/lease expired/);
+  });
+
+  it("treats a claim after a scheduled retry as routine", () => {
+    expect(describeEvent(event({ type: "claimed", jobId: "j", attempt: 2 }), labelFor)).toEqual({
+      title: "Transcode 720p claimed (attempt 2)",
+      tone: "info",
+    });
+  });
+
+  it("explains scheduled retries and permanent failures", () => {
+    const retry = describeEvent(
+      event({
+        type: "retry_scheduled",
+        jobId: "j",
+        attempt: 1,
+        detail: { error: "Storage write timed out", delayMs: 2300, nextAttempt: 2, maxAttempts: 4 },
+      }),
+      labelFor,
+    );
+    expect(retry.title).toBe("Transcode 720p attempt 1 failed; retrying in 2.3 s");
+    expect(retry.note).toContain("Retry 2/4");
+    const permanent = describeEvent(
+      event({ type: "failed", jobId: "j", attempt: 1, detail: { reason: "permanent", error: "Unsupported codec" } }),
+      labelFor,
+    );
+    expect(permanent).toMatchObject({ title: "Transcode 720p failed permanently", tone: "danger" });
   });
 
   it("treats a first claim as routine", () => {

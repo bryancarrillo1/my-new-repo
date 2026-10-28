@@ -12,6 +12,7 @@ import {
   recomputeVideoStatus,
   withTransaction,
   type CreateVideoResponse,
+  type ErrorKind,
   type JobEventView,
   type JobView,
   type JobKind,
@@ -262,10 +263,10 @@ export async function getVideoDetail(ownerId: string, videoId: string): Promise<
   const { rows: jobs } = await pool.query<{
     id: string; kind: JobKind; target_height: number; state: JobState; attempt: number;
     max_attempts: number; progress: number; lease_owner: string | null; last_error: string | null;
-    started_at: Date | null; finished_at: Date | null;
+    error_kind: ErrorKind | null; next_attempt_at: Date; started_at: Date | null; finished_at: Date | null;
   }>(
     `SELECT id, kind, target_height, state, attempt, max_attempts, progress, lease_owner,
-            last_error, started_at, finished_at
+            last_error, error_kind, next_attempt_at, started_at, finished_at
        FROM processing_jobs WHERE video_id = $1
       ORDER BY (kind = 'probe') DESC, target_height`,
     [videoId],
@@ -292,6 +293,8 @@ export async function getVideoDetail(ownerId: string, videoId: string): Promise<
       progress: j.progress,
       leaseOwner: j.lease_owner,
       lastError: j.last_error,
+      errorKind: j.error_kind,
+      nextAttemptAt: j.next_attempt_at.toISOString(),
       startedAt: j.started_at?.toISOString() ?? null,
       finishedAt: j.finished_at?.toISOString() ?? null,
     })),

@@ -1,6 +1,7 @@
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   GetQueueUrlCommand,
   PurgeQueueCommand,
   ReceiveMessageCommand,
@@ -17,59 +18,93 @@ export const sqs = new SQSClient({
   credentials: { accessKeyId: "x", secretAccessKey: "x" },
 });
 
-/** What travels through the queue: a pointer to a job row, never job state. */
+/** What travels through a queue: a pointer to a job row, never job state. */
 export interface JobMessage {
   jobId: string;
 }
 
-// Resolve the queue URL once and share the promise between callers.
-let queueUrlPromise: Promise<string> | undefined;
-export function queueUrl(): Promise<string> {
-  queueUrlPromise ??= sqs
-    .send(new GetQueueUrlCommand({ QueueName: config.SQS_QUEUE_NAME }))
-    .then((res) => res.QueueUrl!);
-  return queueUrlPromise;
+/**
+ * The two queues from PROJECT_OVERVIEW.md: the job queue workers consume, and
+ * the dead-letter queue for exhausted or permanently failed work. The names
+ * match `outbox.queue`, so the dispatcher can route outbox rows directly.
+ */
+export type QueueName = "jobs" | "dead-letter";
+
+const QUEUE_NAMES: Record<QueueName, string> = {
+  jobs: config.SQS_QUEUE_NAME,
+  "dead-letter": config.SQS_DLQ_NAME,
+};
+
+// Resolve each queue URL once and share the promise between callers.
+const urlCache = new Map<QueueName, Promise<string>>();
+export function queueUrl(queue: QueueName = "jobs"): Promise<string> {
+  let url = urlCache.get(queue);
+  if (!url) {
+    url = sqs.send(new GetQueueUrlCommand({ QueueName: QUEUE_NAMES[queue] })).then((res) => res.QueueUrl!);
+    urlCache.set(queue, url);
+  }
+  return url;
 }
 
-export async function sendJobMessage(msg: JobMessage): Promise<void> {
-  await sqs.send(new SendMessageCommand({ QueueUrl: await queueUrl(), MessageBody: JSON.stringify(msg) }));
+export async function sendJobMessage(msg: JobMessage, queue: QueueName = "jobs"): Promise<void> {
+  await sqs.send(new SendMessageCommand({ QueueUrl: await queueUrl(queue), MessageBody: JSON.stringify(msg) }));
 }
 
-/** Long-polls for up to `waitSeconds`. Abort the signal to stop waiting (shutdown). */
+/** Long-polls for up to `waitSeconds`. */
 export async function receiveJobMessages(opts: {
   max: number;
   waitSeconds: number;
   visibilityTimeoutSeconds: number;
-  signal?: AbortSignal;
+  queue?: QueueName;
 }): Promise<Message[]> {
   const res = await sqs.send(
     new ReceiveMessageCommand({
-      QueueUrl: await queueUrl(),
+      QueueUrl: await queueUrl(opts.queue),
       MaxNumberOfMessages: opts.max,
       WaitTimeSeconds: opts.waitSeconds,
       VisibilityTimeout: opts.visibilityTimeoutSeconds,
     }),
-    opts.signal ? { abortSignal: opts.signal } : {},
   );
   return res.Messages ?? [];
 }
 
 /** Acknowledge: the message is gone for good. Until then it will be redelivered. */
-export async function deleteJobMessage(receiptHandle: string): Promise<void> {
-  await sqs.send(new DeleteMessageCommand({ QueueUrl: await queueUrl(), ReceiptHandle: receiptHandle }));
+export async function deleteJobMessage(receiptHandle: string, queue: QueueName = "jobs"): Promise<void> {
+  await sqs.send(new DeleteMessageCommand({ QueueUrl: await queueUrl(queue), ReceiptHandle: receiptHandle }));
 }
 
-/** Keeps an in-flight message hidden from other consumers for `seconds` more. */
+/** Keeps an in-flight message hidden from other consumers for `seconds` more (0 = release now). */
 export async function extendMessageVisibility(receiptHandle: string, seconds: number): Promise<void> {
   await sqs.send(
     new ChangeMessageVisibilityCommand({
-      QueueUrl: await queueUrl(),
+      QueueUrl: await queueUrl("jobs"),
       ReceiptHandle: receiptHandle,
       VisibilityTimeout: seconds,
     }),
   );
 }
 
-export async function purgeQueue(): Promise<void> {
-  await sqs.send(new PurgeQueueCommand({ QueueUrl: await queueUrl() }));
+export interface QueueDepth {
+  /** Waiting to be received. */
+  visible: number;
+  /** Received by a consumer but not yet acknowledged. */
+  inFlight: number;
+}
+
+/** Approximate depth. SQS only promises approximate counts, and so do we. */
+export async function queueDepth(queue: QueueName): Promise<QueueDepth> {
+  const res = await sqs.send(
+    new GetQueueAttributesCommand({
+      QueueUrl: await queueUrl(queue),
+      AttributeNames: ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+    }),
+  );
+  return {
+    visible: Number(res.Attributes?.ApproximateNumberOfMessages ?? 0),
+    inFlight: Number(res.Attributes?.ApproximateNumberOfMessagesNotVisible ?? 0),
+  };
+}
+
+export async function purgeQueue(queue: QueueName = "jobs"): Promise<void> {
+  await sqs.send(new PurgeQueueCommand({ QueueUrl: await queueUrl(queue) }));
 }

@@ -101,17 +101,44 @@ export function describeEvent(e: JobEventView, labelFor: (jobId: string) => stri
       return { title: `${label} job queued via outbox`, tone: "neutral" };
     }
     case "claimed":
+      if (d.takeover) {
+        return {
+          title: `${job} reclaimed (attempt ${e.attempt ?? "?"})`,
+          tone: "warning",
+          note: "The previous attempt's lease expired, so another worker took over.",
+        };
+      }
       return e.attempt && e.attempt > 1
-        ? {
-            title: `${job} reclaimed (attempt ${e.attempt})`,
-            tone: "warning",
-            note: "The previous attempt's lease expired, so another worker took over.",
-          }
+        ? { title: `${job} claimed (attempt ${e.attempt})`, tone: "info" }
         : { title: `${job} claimed`, tone: "info" };
     case "completed":
       return { title: `${job} completed`, tone: "success" };
+    case "retry_scheduled":
+      return {
+        title: `${job} attempt ${e.attempt ?? "?"} failed; retrying in ${formatDuration(Number(d.delayMs ?? 0))}`,
+        tone: "warning",
+        note: `${String(d.error ?? "")}. Retry ${String(d.nextAttempt)}/${String(d.maxAttempts)} after an exponential backoff with jitter.`,
+      };
     case "failed":
-      return { title: `${job} failed: ${String(d.error ?? "unknown error")}`, tone: "danger" };
+      return d.reason === "permanent"
+        ? {
+            title: `${job} failed permanently`,
+            tone: "danger",
+            note: `${String(d.error ?? "")}. Permanent errors aren't retried.`,
+          }
+        : {
+            title: `${job} failed after ${e.attempt ?? "all"} attempts`,
+            tone: "danger",
+            note: String(d.error ?? ""),
+          };
+    case "dead_lettered":
+      return { title: `${job} sent to the dead-letter queue`, tone: "danger" };
+    case "redriven":
+      return {
+        title: `${job} retried by an operator`,
+        tone: "info",
+        note: "A fresh attempt budget. The attempt number keeps counting up: it's the fencing token.",
+      };
     case "stale_write_rejected":
       return {
         title: `${job}: stale write rejected`,
@@ -125,9 +152,17 @@ export function describeEvent(e: JobEventView, labelFor: (jobId: string) => stri
         note: "Graceful shutdown released the lease so another worker could take over immediately.",
       };
     case "lease_expired":
-      return { title: `${job} lease expired`, tone: "warning" };
-    case "retry_scheduled":
-      return { title: `${job} retry scheduled`, tone: "warning" };
+      return {
+        title: `${job}: worker stopped responding`,
+        tone: "warning",
+        note: "Its lease expired without a heartbeat (crash or kill). The reconciler counted the attempt as failed.",
+      };
+    case "requeued":
+      return {
+        title: `${job} re-queued by the reconciler`,
+        tone: "warning",
+        note: "It was overdue with no message in flight, so its queue message was presumed lost.",
+      };
     case "video_status":
       return { title: `Video ${String(d.from)} → ${String(d.to)}`, tone: d.to === "failed" ? "danger" : d.to === "ready" ? "success" : "neutral" };
     default:

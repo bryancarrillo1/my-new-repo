@@ -5,3 +5,5 @@ export * from "./migrate.ts";
 export * from "./domain.ts";
 export * from "./queue.ts";
 export * from "./jobs.ts";
+export * from "./chaos.ts";
+export * from "./workers.ts";

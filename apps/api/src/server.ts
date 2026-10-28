@@ -3,6 +3,7 @@ import cookie from "@fastify/cookie";
 import { ZodError } from "zod";
 import { AppError, config, pool } from "@vpp/core";
 import { EventHub } from "./events.ts";
+import { adminRoutes } from "./routes/admin.ts";
 import { eventRoutes } from "./routes/events.ts";
 import { SESSION_COOKIE, sessionRoutes } from "./routes/session.ts";
 import { videoRoutes } from "./routes/videos.ts";
@@ -69,5 +70,6 @@ export function buildApp(opts: { logger?: boolean } = {}): FastifyInstance {
   app.register(sessionRoutes);
   app.register(videoRoutes);
   app.register(eventRoutes(hub));
+  app.register(adminRoutes);
   return app;
 }

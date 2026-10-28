@@ -1,4 +1,11 @@
-import type { CreateVideoResponse, VideoDetail, VideoStatus, VideoSummary } from "@vpp/core/domain";
+import type {
+  ChaosSettings,
+  CreateVideoResponse,
+  SystemView,
+  VideoDetail,
+  VideoStatus,
+  VideoSummary,
+} from "@vpp/core/domain";
 
 /** Non-2xx response from the API, carrying its machine-readable error code. */
 export class ApiError extends Error {
@@ -56,4 +63,15 @@ export const api = {
     request<{ videoId: string; status: VideoStatus }>(`/videos/${videoId}/uploads/${uploadId}/complete`, {
       method: "POST",
     }),
+
+  // Operator endpoints (internal job management, not the public video API).
+  getSystem: () => request<SystemView>("/admin/system"),
+  updateChaos: (patch: Partial<ChaosSettings>) =>
+    request<ChaosSettings>("/admin/chaos", { method: "PATCH", body: JSON.stringify(patch) }),
+  resetChaos: () => request<ChaosSettings>("/admin/chaos/reset", { method: "POST" }),
+  killWorker: (workerId: string) =>
+    request<{ workerId: string }>(`/admin/workers/${encodeURIComponent(workerId)}/kill`, { method: "POST" }),
+  retryJob: (jobId: string) => request<{ jobId: string }>(`/admin/jobs/${jobId}/retry`, { method: "POST" }),
+  redriveDeadLetters: () =>
+    request<{ messages: number; redriven: number }>("/admin/dlq/redrive", { method: "POST" }),
 };

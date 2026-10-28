@@ -14,8 +14,12 @@ export async function setup(): Promise<void> {
   const core = await import("@vpp/core");
   await core.migrate();
   await core.ensureBucket();
-  await core.purgeQueue();
+  await core.purgeQueue("jobs");
+  await core.purgeQueue("dead-letter");
   // Leftover unsent outbox rows from earlier runs would otherwise be dispatched now.
   await core.pool.query(`UPDATE outbox SET sent_at = now() WHERE sent_at IS NULL`);
+  // Abandoned non-terminal jobs from earlier runs would be picked up by the reconciler.
+  await core.pool.query(`UPDATE processing_jobs SET state = 'failed' WHERE state IN ('pending', 'running')`);
+  await core.pool.query(`DELETE FROM workers`);
   await core.pool.end();
 }

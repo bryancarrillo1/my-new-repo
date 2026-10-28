@@ -45,7 +45,7 @@ Key choices:
 | M1 | Create / upload / complete / status, idempotent create | ✅ |
 | M2 | Jobs + transactional outbox + dispatcher + placeholder worker, leases/fencing/heartbeat, live events (SSE), dev supervisor | ✅ |
 | M3 | React UI v1: login, library, upload, live pipeline view | ✅ |
-| M4 | Retries with backoff + jitter, error classification, DLQ, reconciler, chaos controls | |
+| M4 | Retries with backoff + jitter, error classification, DLQ, reconciler, chaos controls | ✅ |
 | M5 | Real media: ffprobe validation, thumbnails, ffmpeg HLS, progress, verify-before-publish | |
 | M6 | Playback: versioned manifests, CDN cache, playback API, hls.js player | |
 | M7 | Resumable multipart upload in the browser | |
@@ -73,17 +73,34 @@ Key choices:
   - **Zombie long-polls:** aborting `ReceiveMessage` during shutdown let the queue hand the next message to a dead request, hiding it for a whole visibility timeout. Workers now use 5 s polls and never abort one.
   - **Slow handoff on shutdown:** a worker stopped mid-job now releases its lease (fenced) and makes the message visible again, so another worker resumes the job immediately.
 
-### M4: Reliability and chaos controls
-- Errors are classified as `RetryableError` or `PermanentError`.
-  - **Retryable:** the job goes back to `pending` with `next_attempt_at = now() + backoff`, using exponential backoff with full jitter, and a delayed outbox row is written.
-  - **Exhausted or permanent:** the job becomes `failed`.
-- The claim respects `max_attempts`.
-- A reconciler in the dispatcher re-outboxes jobs whose lease expired and pending jobs that have no outbox row. It also fails jobs that have used all their attempts.
-- Workers register in a `workers` table with heartbeats.
-- **Chaos panel:**
-  - A worker list with a Kill button.
-  - A failure-rate slider.
-  - Toggles for crash-after-output-write, permanent failure, slow mode and pausing the dispatcher.
+### M4: Reliability and chaos controls ✅
+No new components. As `PROJECT_OVERVIEW.md` specifies, the reconciler runs inside the Background Dispatcher, failed work goes to a dead-letter queue, and chaos controls are internal `/admin` endpoints backed by Postgres.
+
+- **Error classification:** `PermanentError` (corrupt or unsupported input) fails at once. Everything else is treated as retryable, bounded by `max_attempts = 4` ("three retries means up to four attempts").
+- **Retries:** a retryable failure returns the job to `pending` with `next_attempt_at = now() + backoff`, plus an outbox row whose `available_at` is the same moment. The backoff is exponential with *equal* jitter: half the delay is guaranteed, so delays really increase, and half is random, to spread out retry storms.
+- **Dead-letter queue:** `outbox.queue` can be `jobs` or `dead-letter`, so dead-lettering commits atomically with marking the job failed. The ElasticMQ redrive policy remains a backstop for poison messages.
+- **Redrive:** `POST /admin/jobs/:id/retry` handles one job, and `POST /admin/dlq/redrive` drains the DLQ. Both raise `max_attempts`; the `attempt` counter, which is the fencing token, is never reset. Redriving twice is a no-op.
+- **Claims** refuse jobs that are out of attempts, and record whether they took over a dead worker's expired lease. The timeline flags those takeovers.
+- **Reconciler**, inside the dispatcher, runs every 2 s with `SKIP LOCKED`:
+  - Expired leases count as a failed attempt, so the job retries or is dead-lettered.
+  - Overdue pending jobs with no unsent outbox row are re-queued.
+  - Dead worker registrations are reaped.
+- **Worker registry:** a `workers` table with a 1 s heartbeat that reports the current job and delivers kill requests.
+- **Chaos settings:** a single `chaos_settings` row, read by every worker and the dispatcher:
+  - Transient failure rate.
+  - Permanent failures.
+  - Slow mode.
+  - Pause dispatcher.
+  - "Crash the next N jobs before commit": an atomic one-shot counter.
+- **UI:** a System page with:
+  - Stat tiles: outbox backlog, job queue, DLQ with **Redrive all**, and jobs by state.
+  - Workers with Kill buttons.
+  - Fault-injection controls with optimistic updates.
+  
+  The video page gains retry countdowns, an error-kind label, a **Retry job** button on failed jobs, and timeline entries for every new event type.
+- `npm run demo:chaos` drives all five failure scenarios through the browser and asserts each one recovers. Running it found two more bugs, both fixed with tests:
+  - Toggles snapped back until the next poll.
+  - A `FOR UPDATE` in a CTE made takeover detection silently return nothing.
 
 ### M5: Real media processing
 - The worker image is `node:24-bookworm-slim` plus ffmpeg.

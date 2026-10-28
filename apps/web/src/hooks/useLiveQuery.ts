@@ -80,3 +80,38 @@ export function useNow(active: boolean, intervalMs = 250): number {
   }, [active, intervalMs]);
   return now;
 }
+
+/**
+ * Fetches `load()` every `intervalMs`. For system-wide numbers (queue depths,
+ * worker heartbeats) that change continuously and aren't tied to one video's
+ * events. Skips ticks while a request is still in flight, and while the tab
+ * is hidden.
+ */
+export function usePolling<T>(load: () => Promise<T>, intervalMs: number): QueryState<T> & { refetch: () => void } {
+  const [state, setState] = useState<QueryState<T>>({ data: undefined, error: undefined, loading: true });
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const inFlight = useRef(false);
+
+  const refetch = useCallback(() => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    loadRef
+      .current()
+      .then(
+        (data) => setState({ data, error: undefined, loading: false }),
+        (error: Error) => setState((s) => ({ ...s, error, loading: false })),
+      )
+      .finally(() => {
+        inFlight.current = false;
+      });
+  }, []);
+
+  useEffect(() => {
+    refetch();
+    const id = setInterval(() => document.visibilityState === "visible" && refetch(), intervalMs);
+    return () => clearInterval(id);
+  }, [refetch, intervalMs]);
+
+  return { ...state, refetch };
+}

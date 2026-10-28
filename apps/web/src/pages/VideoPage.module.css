@@ -215,6 +215,13 @@
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface));
 }
+.laneRetrying {
+  border-color: var(--warning);
+  background: color-mix(in srgb, var(--warning-soft) 50%, var(--surface));
+}
+.laneFailed {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+}
 .lanePlaceholder {
   border-style: dashed;
   grid-template-areas: "label waiting waiting";
@@ -267,9 +274,31 @@
 }
 .laneError {
   grid-area: error;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.2rem;
   font-size: 0.8rem;
   color: var(--danger);
   font-family: var(--mono);
+}
+.laneRetrying .laneError {
+  color: var(--warning);
+}
+.retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--sans);
+  flex-shrink: 0;
+}
+.laneErrorInline {
+  font-size: 0.78rem;
+}
+.permanent {
+  color: var(--danger);
+  font-weight: 650;
 }
 @media (max-width: 560px) {
   .lane {
@@ -280,7 +309,14 @@
       "meta meta"
       "error error";
   }
-  .lanePlaceholder {
+  .laneRetrying {
+  border-color: var(--warning);
+  background: color-mix(in srgb, var(--warning-soft) 50%, var(--surface));
+}
+.laneFailed {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+}
+.lanePlaceholder {
     grid-template-areas: "label" "waiting";
   }
 }

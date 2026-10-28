@@ -10,21 +10,25 @@ import {
   type JobKind,
   type JobRow,
 } from "@vpp/core";
+import type { Faults } from "./faults.ts";
 
 export interface JobContext {
   job: JobRow;
   workerId: string;
   signal: AbortSignal;
+  faults: Faults;
 }
 
 export type JobHandler = (ctx: JobContext) => Promise<void>;
 
-// M2 placeholders: they simulate work with sleeps so the queue/outbox/claim
+// Placeholders: they simulate work with sleeps so the queue/outbox/claim
 // machinery can be built and observed before real ffmpeg arrives in M5.
 
 /** Pretends to inspect the source, then fans out one transcode job per target height. */
-const probe: JobHandler = async ({ job, workerId, signal }) => {
-  await sleep(config.PLACEHOLDER_STEP_MS, undefined, { signal });
+const probe: JobHandler = async ({ job, workerId, signal, faults }) => {
+  faults.atStart();
+  await sleep(config.PLACEHOLDER_STEP_MS * faults.slowFactor, undefined, { signal });
+  await faults.beforeCommit();
   await withTransaction(async (tx) => {
     // Fence first: if we no longer own the job, nothing below is written.
     await markJobCompleted(tx, job, workerId);
@@ -37,11 +41,13 @@ const probe: JobHandler = async ({ job, workerId, signal }) => {
 };
 
 /** Pretends to transcode in 10 steps, reporting progress, then records a rendition. */
-const transcode: JobHandler = async ({ job, workerId, signal }) => {
+const transcode: JobHandler = async ({ job, workerId, signal, faults }) => {
+  faults.atStart();
   for (let step = 1; step <= 10; step++) {
-    await sleep(config.PLACEHOLDER_STEP_MS, undefined, { signal });
+    await sleep(config.PLACEHOLDER_STEP_MS * faults.slowFactor, undefined, { signal });
     await updateProgress(job, step / 10);
   }
+  await faults.beforeCommit();
   await withTransaction(async (tx) => {
     await markJobCompleted(tx, job, workerId);
     await tx.query(

@@ -137,6 +137,16 @@ describe("fencing", () => {
     );
     // B, the current owner, succeeds.
     await withTransaction((tx) => markJobCompleted(tx, second!, "worker-b"));
+
+    // The second claim is recorded as a takeover of A's dead lease (the UI flags it).
+    const { rows: claims } = await pool.query(
+      `SELECT attempt, detail FROM job_events WHERE job_id = $1 AND type = 'claimed' ORDER BY id`,
+      [jobId],
+    );
+    expect(claims).toEqual([
+      { attempt: 1, detail: {} },
+      { attempt: 2, detail: { takeover: true, previousOwner: "worker-a" } },
+    ]);
   });
 });
 

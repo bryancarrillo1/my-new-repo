@@ -1,6 +1,6 @@
 # Video Processing Pipeline
 
-Upload → process → watch: a TypeScript implementation of the system design in [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md). It covers a transactional outbox, queue-driven workers with fenced leases and heartbeats, idempotent APIs, and a React UI that shows the pipeline working live. It's built milestone by milestone; see [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
+Upload → process → watch: a TypeScript implementation of the system design in [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md). It covers a transactional outbox, queue-driven workers with fenced leases and heartbeats, retries with backoff and a dead-letter queue, a reconciler, idempotent APIs, and a React UI that shows the pipeline working live, including a chaos panel for breaking it on purpose. It's built milestone by milestone; see [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 
 ![Pipeline view: probe done, two transcodes running on different workers, live event timeline](docs/images/pipeline-running.png)
 
@@ -10,8 +10,8 @@ Upload → process → watch: a TypeScript implementation of the system design i
 | M1 Create / upload / complete / status, idempotent create | ✅ |
 | M2 Jobs, transactional outbox, dispatcher, placeholder worker, leases + fencing + heartbeat, SSE live events | ✅ |
 | M3 React UI: login, library, upload with progress, live pipeline view + event timeline | ✅ |
-| M4 Retries + backoff, DLQ, reconciler, chaos controls | ⏳ next |
-| M5 Real media: ffprobe/ffmpeg HLS, thumbnails, verify-before-publish | |
+| M4 Retries with backoff + jitter, dead-letter queue, reconciler, worker registry, chaos controls | ✅ |
+| M5 Real media: ffprobe/ffmpeg HLS, thumbnails, verify-before-publish | ⏳ next |
 | M6 Versioned manifests, playback API, CDN cache, hls.js player | |
 | M7 Resumable multipart upload in the browser | |
 | M8 Metrics panel + structured logging | |
@@ -23,7 +23,17 @@ Upload → process → watch: a TypeScript implementation of the system design i
 |---|---|
 | ![Upload page](docs/images/upload.png) | ![Library](docs/images/library.png) |
 
-**After `kill -9` on a worker mid-transcode:** the 720p job's lease expired, another worker reclaimed it as attempt 2, and the video still finished. The timeline flags the reclaim and explains it.
+### Breaking it on purpose: the System page
+
+The System page shows live workers, queue/outbox/DLQ depths and fault-injection controls. Each control demonstrates one failure mode from the design.
+
+![System page: one worker just killed and presumed dead, two others busy](docs/images/system-kill.png)
+
+| Transient failures: retried with backoff + jitter | Permanent failure: no retries, dead-lettered, operator retry |
+|---|---|
+| ![Retry countdown on a job lane](docs/images/retry-backoff.png) | ![Failed probe with a Retry button](docs/images/permanent-failure.png) |
+
+**After killing a worker mid-transcode:** its lease expired without a heartbeat, the reconciler counted the attempt as failed and scheduled a retry, and attempt 2 finished the job.
 
 ![Pipeline view after killing a worker](docs/images/pipeline-chaos.png)
 
@@ -35,8 +45,9 @@ flowchart LR
   C -->|"presigned PUT"| S3[("S3 (SeaweedFS)")]
   API -->|"job + outbox row<br/>in one transaction"| PG[("Postgres")]
   PG -. "LISTEN/NOTIFY" .-> API
-  D["Dispatcher"] -->|"SKIP LOCKED"| PG
-  D -->|"jobId"| Q["SQS (ElasticMQ)"]
+  D["Dispatcher + reconciler"] -->|"SKIP LOCKED"| PG
+  D -->|"jobId"| Q["Job queue (SQS)"]
+  D -->|"exhausted jobs"| DLQ["Dead-letter queue"]
   Q --> W["Workers ×2"]
   W -->|"claim lease · heartbeat · fenced write"| PG
 ```
@@ -46,21 +57,23 @@ flowchart LR
 3. The dispatcher sends due outbox rows to the queue, at least once.
 4. A worker claims the job row, getting a lease and an attempt number that acts as a fencing token. It renews the lease while it works and commits results only if it still owns the job.
 5. The probe fans out 360/720/1080 transcode jobs. Each finished rendition becomes playable immediately.
-6. Every state change emits an event: a row in `job_events` plus `pg_notify`. The API streams these to the UI over SSE, and the UI refetches what changed.
+6. A failed attempt is **retried** with exponential backoff and jitter, up to 4 attempts. **Permanent** errors (corrupt input) skip retries. Either way, a job that ends up failed is **dead-lettered** through the outbox, in the same transaction that marks it failed.
+7. The **reconciler**, inside the dispatcher, catches what the queue can't: running jobs whose worker died (lease expired), pending jobs whose message was lost, and dead worker registrations.
+8. Every state change emits an event: a row in `job_events` plus `pg_notify`. The API streams these to the UI over SSE, and the UI refetches what changed.
 
 Workers still run **placeholder** handlers (sleep + progress); real ffmpeg arrives in M5.
 
 ## Layout
 
 ```
-apps/web/          React + Vite UI: library, upload, live pipeline view
-apps/api/          Fastify HTTP API: routes → service → SQL; SSE event hub
-apps/dispatcher/   Outbox → queue relay
-apps/worker/       Queue consumer: claim, heartbeat, handlers, fenced results
+apps/web/          React + Vite UI: library, upload, live pipeline view, System page
+apps/api/          Fastify HTTP API: routes → service → SQL; SSE event hub; /admin operator API
+apps/dispatcher/   Outbox → queue relay + reconciler
+apps/worker/       Queue consumer: claim, heartbeat, handlers, retries, fault injection
 packages/core/     Shared config, Postgres, S3, SQS, job state machine, domain types
 migrations/        Plain .sql files, applied in filename order
 infra/             Local S3 (SeaweedFS) and SQS (ElasticMQ) config
-scripts/           dev supervisor, setup, test setup, browser smoke test
+scripts/           dev supervisor, setup, test setup, browser smoke test, chaos walkthrough
 docs/              Roadmap and screenshots (architecture and demo docs come in M9)
 ```
 
@@ -81,6 +94,7 @@ Open **http://localhost:5173**, pick any username, and upload a file. Until M5 t
 - `npm run dev -- --workers 3` runs more workers. `npm run dev:web`, `dev:api`, `dev:worker` and `dev:dispatcher` each run one service with reload on change.
 - `PLACEHOLDER_STEP_MS=800 npm run dev` slows the fake jobs down, so you have time to watch, or to kill a worker.
 - `npm run smoke:ui` (with the stack running) drives the UI in headless Chromium and saves screenshots to `./screenshots`. Run `npx playwright install chromium` once first.
+- `npm run demo:chaos` (with the stack running) walks through every failure scenario in the browser: retries, a permanent failure plus operator retry, a killed worker, a dispatcher outage, and a crash before commit. It asserts each one recovers. Start the stack with `JOB_LEASE_SECONDS=10 PLACEHOLDER_STEP_MS=500 npm run dev` so lease expiries happen quickly.
 
 ### Walk through the pipeline with curl
 
@@ -114,8 +128,13 @@ curl -s localhost:3000/videos/<videoId> -H 'x-user-id: alice'   # jobs + event t
 | Call `/complete` twice | One probe job, same response | Conditional updates + `UNIQUE(video_id, kind, target_height)` |
 | `/complete` before uploading | `409 upload_incomplete` | Storage is checked, not trusted |
 | Upload fewer bytes than declared | Storage rejects the PUT | `Content-Length` is part of the signature |
-| Run `PLACEHOLDER_STEP_MS=800 JOB_LEASE_SECONDS=8 npm run dev`, then `kill -9` the PID shown on a running job's lane in the UI | That job is reclaimed as attempt 2 after ~8 s, flagged in the timeline, and the video still ends `ready` | Unacked message reappears after the visibility timeout; the claim succeeds on the expired lease |
+| **Kill** a busy worker on the System page (or `kill -9` its PID) | It shows as dead; its job is reclaimed as attempt 2 after one lease and the video still ends `ready` | Lease expiry + visibility timeout; the reconciler counts the lost attempt |
 | Ctrl-C `npm run dev` while jobs are running, then start it again | The jobs are picked up immediately, not after a lease | Graceful shutdown releases the lease (fenced) and makes the message visible again |
+| Set the **transient failure rate** to 60% | Jobs fail, show "retrying in 1.2 s", and mostly succeed on a later attempt | Exponential backoff with jitter; the outbox row only becomes due when the backoff ends |
+| Set it to 100% | Each job fails 4 times, then lands in the dead-letter queue; **Redrive all** brings it back | Bounded retries; redrive raises `max_attempts` but never resets the attempt (fencing) number |
+| Turn on **permanent failures** | Jobs fail on attempt 1 with no retries; a **Retry job** button appears | Corrupt input shouldn't be retried |
+| **Pause the dispatcher**, then upload | The upload still succeeds; the video stays `queued` and the outbox backlog grows, then drains on resume | The job and its outbox row commit together; dispatch is decoupled |
+| **Arm one crash** | The next job's worker dies after the work but before the DB commit; the job is redone as attempt 2 | "Output saved, database not updated": nothing is lost or double-counted |
 
 ## Notes and gotchas
 
@@ -125,4 +144,6 @@ curl -s localhost:3000/videos/<videoId> -H 'x-user-id: alice'   # jobs + event t
 - **Foreign keys take locks:** inserting a `job_events` row takes `FOR KEY SHARE` on its video. Recomputing the status with `FOR UPDATE`, which conflicts with that, deadlocked when two jobs finished at once. The UI smoke test caught it. The fix is `FOR NO KEY UPDATE`, and a regression test in `apps/worker/test/pipeline.test.ts` covers it.
 - **Never abort a long-poll:** aborting `ReceiveMessage` mid-wait only closes the client's end. The queue can still hand the next message to that dead request and hide it for a full visibility timeout, which caused a 30 s stall after every restart. Workers now use 5 s polls and let them finish on shutdown.
 - **Bucket CORS:** the browser PUTs straight to S3 from the UI's origin, so `npm run setup` applies a CORS rule (`CORS_ORIGINS`) to the bucket. The API itself needs no CORS, because the Vite dev server proxies `/api`.
+- **Optimistic UI for controls:** the System page polls every second. Controlled toggles that only reflected polled state snapped back for up to a second after each click, which the chaos walkthrough caught. They now show the new value immediately and roll back if the save fails.
+- **A locking CTE can see nothing:** detecting "this claim took over a dead worker's lease" first used `WITH prev AS (SELECT … FOR UPDATE)`. Postgres evaluates the CTE lazily, after the `UPDATE` has changed the row, and silently skips rows "updated by the current command" when locking, so it returned nothing. A plain `SELECT` reads the pre-statement snapshot, which is what's wanted. A test pins this down.
 - **Postgres `bigint`** comes back from `pg` as a string, since JS numbers can't hold every 64-bit integer. It's converted explicitly where it's used.

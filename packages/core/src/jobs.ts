@@ -1,6 +1,6 @@
 import { config } from "./config.ts";
 import { withTransaction, type Queryable } from "./db.ts";
-import type { JobKind, JobState, PipelineEvent, VideoStatus } from "./domain.ts";
+import type { ErrorKind, JobKind, JobState, PipelineEvent, VideoStatus } from "./domain.ts";
 
 export interface JobRow {
   id: string;
@@ -14,6 +14,8 @@ export interface JobRow {
   lease_expires_at: Date | null;
   progress: number;
   last_error: string | null;
+  error_kind: ErrorKind | null;
+  next_attempt_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
 }
@@ -24,6 +26,24 @@ export class StaleLeaseError extends Error {
     super(`Lease lost for job ${jobId} (attempt ${attempt})`);
     this.name = "StaleLeaseError";
   }
+}
+
+/**
+ * A failure worth retrying: a network blip, a timeout, a full disk, a
+ * deadlock. The job gets another attempt after a backoff delay, up to
+ * max_attempts.
+ */
+export class RetryableError extends Error {
+  override name = "RetryableError";
+}
+
+/**
+ * A failure that retrying can't fix: corrupt or unsupported input. The job
+ * fails immediately and is dead-lettered (PROJECT_OVERVIEW: "Corrupt or
+ * unsupported input should fail without repeated retries").
+ */
+export class PermanentError extends Error {
+  override name = "PermanentError";
 }
 
 export const PIPELINE_CHANNEL = "pipeline";
@@ -52,6 +72,31 @@ export function computeVideoStatus(
   if (jobs.every((j) => isTerminal(j.state))) return renditionCount > 0 ? "ready" : "failed";
   if (jobs.some((j) => j.state !== "pending")) return "processing";
   return "queued";
+}
+
+/**
+ * Unknown errors count as retryable: most surprises in a pipeline (network,
+ * storage, a deadlock) are transient, and max_attempts bounds the cost of
+ * being wrong. Only errors that explicitly say "retrying won't help" are permanent.
+ */
+export function classifyError(err: unknown): ErrorKind {
+  return err instanceof PermanentError ? "permanent" : "retryable";
+}
+
+/**
+ * Delay before retry number `attempt` (1-based: the delay after the first
+ * failed attempt is attempt=1). Exponential with "equal jitter": half the
+ * exponential delay is guaranteed, the other half is random. The guaranteed
+ * half makes delays actually increase; the random half spreads out workers that
+ * failed together (e.g. during an outage) so they don't all retry in lockstep.
+ */
+export function backoffDelayMs(
+  attempt: number,
+  opts: { baseMs: number; maxMs: number },
+  random: () => number = Math.random,
+): number {
+  const exponential = Math.min(opts.maxMs, opts.baseMs * 2 ** Math.max(0, attempt - 1));
+  return Math.round(exponential / 2 + random() * (exponential / 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +152,9 @@ export async function enqueueJob(
   job: { videoId: string; kind: JobKind; targetHeight?: number },
 ): Promise<string | null> {
   const { rows } = await tx.query<{ id: string }>(
-    `INSERT INTO processing_jobs (video_id, kind, target_height) VALUES ($1, $2, $3)
+    `INSERT INTO processing_jobs (video_id, kind, target_height, max_attempts) VALUES ($1, $2, $3, $4)
      ON CONFLICT (video_id, kind, target_height) DO NOTHING RETURNING id`,
-    [job.videoId, job.kind, job.targetHeight ?? 0],
+    [job.videoId, job.kind, job.targetHeight ?? 0, config.JOB_MAX_ATTEMPTS],
   );
   const jobId = rows[0]?.id;
   if (!jobId) return null;
@@ -135,14 +180,23 @@ export async function getJob(db: Queryable, jobId: string): Promise<JobRow | nul
 /**
  * Atomically takes ownership of a job for one lease period. Succeeds only if
  * the job is pending, or running under a lease that has already expired (its
- * worker presumably died). Returns null if someone else holds it or it's done.
+ * worker presumably died), and it still has attempts left. Returns null if
+ * someone else holds it, it's done, or it's out of attempts (the reconciler
+ * then fails and dead-letters it).
  *
  * The returned `attempt` is this worker's fencing token.
  */
 export async function claimJob(jobId: string, workerId: string): Promise<JobRow | null> {
   return withTransaction(async (tx) => {
-    const { rows } = await tx.query<JobRow>(
-      `UPDATE processing_jobs
+    // The CTE reads the row as it was before this statement (all parts of one
+    // statement share a snapshot), so we can tell a normal claim from a
+    // takeover of a dead worker's expired lease, worth flagging in the UI.
+    // It must NOT say FOR UPDATE: it's evaluated lazily, after the UPDATE has
+    // modified the row, and Postgres silently skips rows "updated by the
+    // current command" when locking, so prev would come back empty.
+    const { rows } = await tx.query<JobRow & { prev_owner: string | null; prev_state: JobState }>(
+      `WITH prev AS (SELECT state, lease_owner FROM processing_jobs WHERE id = $1)
+       UPDATE processing_jobs
           SET state = 'running',
               attempt = attempt + 1,
               lease_owner = $2,
@@ -151,13 +205,23 @@ export async function claimJob(jobId: string, workerId: string): Promise<JobRow 
               progress = 0
         WHERE id = $1
           AND next_attempt_at <= now()
+          AND attempt < max_attempts
           AND (state = 'pending' OR (state = 'running' AND lease_expires_at < now()))
-        RETURNING *`,
+        RETURNING processing_jobs.*, (SELECT lease_owner FROM prev) AS prev_owner, (SELECT state FROM prev) AS prev_state`,
       [jobId, workerId, config.JOB_LEASE_SECONDS],
     );
-    const job = rows[0];
-    if (!job) return null;
-    await emitEvent(tx, { videoId: job.video_id, jobId, type: "claimed", attempt: job.attempt, workerId });
+    const row = rows[0];
+    if (!row) return null;
+    const { prev_owner, prev_state, ...job } = row;
+    const takeover = prev_state === "running";
+    await emitEvent(tx, {
+      videoId: job.video_id,
+      jobId,
+      type: "claimed",
+      attempt: job.attempt,
+      workerId,
+      detail: takeover ? { takeover: true, previousOwner: prev_owner } : {},
+    });
     await recomputeVideoStatus(tx, job.video_id);
     return job;
   });
@@ -226,21 +290,117 @@ export async function markJobCompleted(tx: Queryable, job: JobRow, workerId: str
   await emitEvent(tx, { videoId: job.video_id, jobId: job.id, type: "completed", attempt: job.attempt, workerId });
 }
 
-export async function markJobFailed(tx: Queryable, job: JobRow, workerId: string, error: string): Promise<void> {
+export interface FailureInput {
+  error: string;
+  kind: ErrorKind;
+  /** Who observed the failure: a worker id, or "reconciler". */
+  actor: string;
+}
+
+/**
+ * Records a failed attempt and decides what happens next, in the caller's
+ * transaction:
+ *   - retryable with attempts left → back to `pending` with a backoff delay,
+ *     plus an outbox row that only becomes due after that delay
+ *   - permanent, or out of attempts → `failed`, plus a dead-letter outbox row
+ *
+ * Fenced on (attempt, state = 'running'), like every result write.
+ * Returns what it did so callers can log it.
+ */
+export async function recordFailure(
+  tx: Queryable,
+  job: JobRow,
+  failure: FailureInput,
+): Promise<"retry_scheduled" | "dead_lettered"> {
+  const retry = failure.kind === "retryable" && job.attempt < job.max_attempts;
+
+  if (retry) {
+    const delayMs = backoffDelayMs(job.attempt, { baseMs: config.RETRY_BASE_MS, maxMs: config.RETRY_MAX_MS });
+    const res = await tx.query<{ next_attempt_at: Date }>(
+      `UPDATE processing_jobs
+          SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL, progress = 0,
+              last_error = $3, error_kind = 'retryable',
+              next_attempt_at = now() + make_interval(secs => $4::float8 / 1000)
+        WHERE id = $1 AND attempt = $2 AND state = 'running'
+        RETURNING next_attempt_at`,
+      [job.id, job.attempt, failure.error, delayMs],
+    );
+    if (res.rowCount === 0) throw new StaleLeaseError(job.id, job.attempt);
+    // The outbox row becomes due at the same moment the job does, so the
+    // dispatcher only sends it once a worker is allowed to claim it.
+    await tx.query(`INSERT INTO outbox (job_id, available_at) VALUES ($1, $2)`, [job.id, res.rows[0]!.next_attempt_at]);
+    await emitEvent(tx, {
+      videoId: job.video_id,
+      jobId: job.id,
+      type: "retry_scheduled",
+      attempt: job.attempt,
+      workerId: failure.actor,
+      detail: { error: failure.error, delayMs, nextAttempt: job.attempt + 1, maxAttempts: job.max_attempts },
+    });
+    await recomputeVideoStatus(tx, job.video_id);
+    return "retry_scheduled";
+  }
+
   const res = await tx.query(
     `UPDATE processing_jobs
-        SET state = 'failed', finished_at = now(), last_error = $3, lease_owner = NULL, lease_expires_at = NULL
+        SET state = 'failed', finished_at = now(), last_error = $3, error_kind = $4,
+            lease_owner = NULL, lease_expires_at = NULL
       WHERE id = $1 AND attempt = $2 AND state = 'running'`,
-    [job.id, job.attempt, error],
+    [job.id, job.attempt, failure.error, failure.kind],
   );
   if (res.rowCount === 0) throw new StaleLeaseError(job.id, job.attempt);
+  // Dead-lettering goes through the outbox too, so it commits atomically with
+  // the failure: there's never a failed job missing from the DLQ, or vice versa.
+  await tx.query(`INSERT INTO outbox (job_id, queue) VALUES ($1, 'dead-letter')`, [job.id]);
   await emitEvent(tx, {
     videoId: job.video_id,
     jobId: job.id,
     type: "failed",
     attempt: job.attempt,
-    workerId,
-    detail: { error },
+    workerId: failure.actor,
+    detail: {
+      error: failure.error,
+      errorKind: failure.kind,
+      reason: failure.kind === "permanent" ? "permanent" : "exhausted",
+    },
+  });
+  await emitEvent(tx, { videoId: job.video_id, jobId: job.id, type: "dead_lettered", attempt: job.attempt });
+  await recomputeVideoStatus(tx, job.video_id);
+  return "dead_lettered";
+}
+
+/**
+ * Operator action ("redrive"): gives a failed job a fresh budget of attempts.
+ *
+ * Note what does NOT happen: `attempt` is never reset. It's the fencing token,
+ * so it must only ever increase; a zombie from attempt 3 must not become
+ * valid again. Instead the ceiling moves: max_attempts = attempt + budget.
+ * Returns false if the job isn't failed (already redriven, or never failed),
+ * which makes redriving idempotent.
+ */
+export async function redriveJob(jobId: string, actor: string): Promise<boolean> {
+  return withTransaction(async (tx) => {
+    const { rows } = await tx.query<JobRow>(
+      `UPDATE processing_jobs
+          SET state = 'pending', max_attempts = attempt + $2, next_attempt_at = now(),
+              progress = 0, error_kind = NULL, finished_at = NULL
+        WHERE id = $1 AND state = 'failed'
+        RETURNING *`,
+      [jobId, config.JOB_MAX_ATTEMPTS],
+    );
+    const job = rows[0];
+    if (!job) return false;
+    await tx.query(`INSERT INTO outbox (job_id) VALUES ($1)`, [job.id]);
+    await emitEvent(tx, {
+      videoId: job.video_id,
+      jobId: job.id,
+      type: "redriven",
+      attempt: job.attempt,
+      workerId: actor,
+      detail: { maxAttempts: job.max_attempts },
+    });
+    await recomputeVideoStatus(tx, job.video_id);
+    return true;
   });
 }
 
